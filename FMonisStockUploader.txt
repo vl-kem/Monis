@@ -1,0 +1,838 @@
+[AR754369_AR754408_InsMultiSameAlias_NoIsinUndLookUp]FObject:FMonisStockUploader
+""" Compiled: 2019-12-02 22:25:40 """
+
+"""-------------------------------------------------------------------------------------------------------
+MODULE
+    FMonisStockUploader - 
+
+    (c) Copyright 2016 SunGard FRONT ARENA. All rights reserved.
+
+DESCRIPTION
+
+-------------------------------------------------------------------------------------------------------"""
+
+# pylint: disable-msg=E0611
+
+import acm
+import FMonisIUploader
+import FMonisUploadUtils
+
+from FMonisStockDividends import DividendStreamUploader, StockDividendYieldUploader, StockBorrowCostUploader
+from FMonisFParameters import FMonisUploadInstrumentInfo, FMonisUploadParameters, FMonisGlobalParameters
+from FMonisUploadUtils import UnderlyingUploadError, SaveUnderlyingObject, UtilMethods
+from FMonisUtils import MonisLogger
+
+logger = MonisLogger.GetLogger()
+
+GLOB_FPARAMS = FMonisGlobalParameters()
+
+
+class AddInfoCreator(object):
+    ''' Responsible for creating the AddInfos on the underlying entity '''
+
+    def __init__(self, underlying, FCOM_convertible):
+        self.underlying = underlying
+        self.FCOM_convertible = FCOM_convertible
+
+    def CreateAddInfo(self):
+        addInfoSpec = acm.FAdditionalInfoSpec[GLOB_FPARAMS.ADD_INFO_STOCK_ID_SPEC]
+        if not addInfoSpec.AddInfoContainer(self.underlying):
+            addInfo = acm.FAdditionalInfo()
+            addInfo.AddInf(addInfoSpec)
+        else:
+            addInfo = addInfoSpec.AddInfo(self.underlying)
+        identifier_field = GLOB_FPARAMS.MONIS_STOCK_ID_FIELD
+        try:
+            if identifier_field in ('StockCUSIP',):
+                identifier_value = self.FCOM_convertible.GenericObject().PerformWith('GetInputString', [identifier_field])
+            else:
+                identifier_value = getattr(self.FCOM_convertible, identifier_field)()
+        except:
+            raise Exception('ERROR: Unable to call method %s on COM convertible!' % identifier_field)
+        if identifier_value:
+            addInfo.FieldValue(identifier_value)
+        else:
+            raise Exception('ERROR: Field %s on COM convertible is empty, cannot store it as add info!' % identifier_field)
+        addInfo.Recaddr(self.underlying.Oid())
+        SaveUnderlyingObject(addInfo, 'Committed additional info %s' % GLOB_FPARAMS.ADD_INFO_STOCK_ID_SPEC,
+                             'Could not populate additional info %s' % GLOB_FPARAMS.ADD_INFO_STOCK_ID_SPEC)
+        return addInfo
+
+
+class StockRetrieverBase(object):
+    ''' Base for classes responsible for retrieving a stock and data about a stock, 
+        using different types of Instrument Aliases (e.g. CUSIP, SEDOL, MonisID etc.).
+    '''
+
+    def __init__(self, FCOM_convertible):
+        self.FCOM_convertible = FCOM_convertible
+        self.up_params = self._UploadParameters()
+
+    @staticmethod
+    def _UploadParameters():
+        return FMonisUploadParameters()
+
+    # AR754369 ================================================================
+    # The FInstrumantAliase.Select01 throws RuntimeError if it finds more than
+    # one instrument alias that have the same alias value, despite it could be
+    # on the same instrment but of different alias types.
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< Comment out below code
+    #@staticmethod
+    #def _GetStockByAliasValue(aliasValue):
+    #    if not aliasValue:
+    #        return None
+    #    # Is it really safe to retrieve alias value without defining alias type?
+    #    alias = acm.FInstrumentAlias.Select01("alias=%s" % aliasValue, None)
+    #    if not alias:
+    #        return None
+    #    stock = alias.Instrument()
+    #    return stock
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Add below code
+    @staticmethod
+    def _GetStockByAliasValue(aliasValue):
+        if not aliasValue:
+            return None
+        insList = [
+            ia.Instrument() for ia in
+            acm.FInstrumentAlias.Select("alias=%s" % aliasValue)
+        ]
+        numIns = len(insList)
+        if numIns > 1:
+            logger.warn(
+                "Multiple ({}) instrument aliases are found for same alias "
+                "value '{}'.  They could be really confusing if not all of "
+                "them are on the same instrument!  The instruments where "
+                "these instrument aliases attached to are: {}".format(
+                numIns, aliasValue, sorted(set(ins.Name() for ins in insList)))
+            )
+        validUndTypes = ("Stock", "EquityIndex", "Depositary Receipt")
+        stock = next(
+            (
+                ins for ins in insList
+                if ins.InsType() in validUndTypes
+            ),
+            None
+        )
+        return stock
+    # =========================================================================
+
+
+    def IsEnabled(self):
+        raise NotImplementedError('Class must implement method IsEnabled, returning a boolean.')
+        
+    def StockFromAlias(self):
+        raise NotImplementedError('Class must implement method StockFromAlias, returning a boolean.')    
+
+    def AliasValue(self):
+        raise NotImplementedError('Class must implement method AliasValue, returning a identifier-value.')
+
+    def LogMessageIfFound(self, underlying):
+        raise NotImplementedError('Class must implement LogMessageIfFound, returning a string.')
+        
+    def GetStockIsin(self):
+        return self.FCOM_convertible.GenericObject().PerformWith('GetInputString', ['StockISIN'])        
+
+    def GetStockByAlias(self):
+        stock = None
+        if self.IsEnabled():
+            if self.StockFromAlias():
+                aliasValue = self.AliasValue()
+                stock = self._GetStockByAliasValue(aliasValue)
+        if stock:
+            logMessage = self.LogMessageIfFound(stock)
+            logger.DLOG(logMessage)
+        return stock
+
+
+class StockRetrieverByCusip(StockRetrieverBase):
+
+    def IsEnabled(self):
+        return bool(self.up_params.USE_UND_CUSIP)
+        
+    def StockFromAlias(self):
+        return True
+
+    def AliasValue(self):
+        return self.FCOM_convertible.GenericObject().PerformWith('GetInputString', ['StockCUSIP'])
+
+    def LogMessageIfFound(self, underlying):
+        return 'Found underlying "%s" by Cusip' % underlying.Name()
+
+
+class StockRetrieverBySedol(StockRetrieverBase):
+
+    def IsEnabled(self):
+        return bool(self.up_params.USE_UND_SEDOL)
+        
+    def StockFromAlias(self):
+        return True        
+
+    def AliasValue(self):
+        return self.FCOM_convertible.StockSEDOL()
+
+    def LogMessageIfFound(self, underlying):
+        return 'Found underlying "%s" by SEDOL' % underlying.Name()
+
+
+class StockRetrieverByMonisId(StockRetrieverBase):
+
+    def IsEnabled(self):
+        return bool(self.up_params.USE_UND_MONIS_ID)
+        
+    def StockFromAlias(self):
+        return True        
+
+    def AliasValue(self):
+        return self.FCOM_convertible.StockMonisID()
+
+    def LogMessageIfFound(self, underlying):
+        return 'Found underlying "%s" by Monis ID %s' % (underlying.Name(), self.FCOM_convertible.StockMonisID())
+
+
+class StockRetrieverByUserId1(StockRetrieverBase):
+
+    def IsEnabled(self):
+        return bool(self.up_params.USE_UND_USER_ID1)
+        
+    def StockFromAlias(self):
+        return True        
+
+    def AliasValue(self):
+        return self.FCOM_convertible.StockID1Value()
+
+    def LogMessageIfFound(self, underlying):
+        return 'Found underlying "%s" by Stock ID1' % underlying.Name()
+
+
+class StockRetrieverByUserId2(StockRetrieverBase):
+
+    def IsEnabled(self):
+        return bool(self.up_params.USE_UND_USER_ID2)
+        
+    def StockFromAlias(self):
+        return True        
+
+    def AliasValue(self):
+        return self.FCOM_convertible.StockID2Value()
+
+    def LogMessageIfFound(self, underlying):
+        return 'Found underlying "%s" by Stock ID2' % underlying.Name()
+
+
+class StockRetrieverByBloombergSymbol(StockRetrieverBase):
+
+    def IsEnabled(self):
+        return bool(self.up_params.USE_UND_BLOOMBERGSYMBOL)
+        
+    def StockFromAlias(self):
+        return True        
+
+    def AliasValue(self):
+        return self.FCOM_convertible.StockBloombergSymbol()
+
+    def LogMessageIfFound(self, underlying):
+        return 'Found underlying "%s" by Stock Bloomberg symbol' % underlying.Name()
+        
+        
+class StockRetrieverByIsin(StockRetrieverBase):
+
+    def IsEnabled(self):
+        return bool(self.up_params.USE_UND_ISIN)
+        
+    def StockFromAlias(self):
+        return False        
+
+    def LogMessageIfFound(self, underlying):
+        return 'Found underlying "%s" by ISIN symbol' % underlying.Name()
+                
+
+class UnderlyingRetrieverByUnderlyingIdentifiers(object):
+
+    acmUnderlyingClass = None
+    
+
+class StockRetrieverByUnderlyingIdentifiers(UnderlyingRetrieverByUnderlyingIdentifiers):
+    ''' Responsible for retrieving the stock (if any) from the database, 
+        using the stock identifiers applied to the FCOM_convertible instance.
+    '''
+    
+    acmUnderlyingClass = acm.FStock
+
+    def __init__(self, FCOM_convertible):
+        self.FCOM_convertible = FCOM_convertible
+        self.up_params = FMonisUploadParameters()
+
+    def _GetStockByAliasUsing(self, StockRetrievalClass):
+        return StockRetrievalClass(self.FCOM_convertible).GetStockByAlias()
+        
+    def _GetStockIsinUsing(self, StockRetrievalClass):
+        return StockRetrievalClass(self.FCOM_convertible).GetStockIsin()
+        
+    def _GetStockByCusip(self):
+        return self._GetStockByAliasUsing(StockRetrieverByCusip)
+
+    def _GetStockBySedol(self):
+        return self._GetStockByAliasUsing(StockRetrieverBySedol)
+
+    def _GetStockByMonisId(self):
+        return self._GetStockByAliasUsing(StockRetrieverByMonisId)
+
+    def _GetStockByUserId1(self):
+        return self._GetStockByAliasUsing(StockRetrieverByUserId1)
+
+    def _GetStockByUserId2(self):
+        return self._GetStockByAliasUsing(StockRetrieverByUserId2)
+
+    def _GetStockByBloombergSymbol(self):
+        return self._GetStockByAliasUsing(StockRetrieverByBloombergSymbol)
+        
+    def GetStockIsin(self):
+        return self._GetStockIsinUsing(StockRetrieverByIsin)
+    
+    def GetStockByIsin(self):
+        isin = self.GetStockIsin()
+        return self.acmUnderlyingClass.Select01('isin=%s' % isin, None) if isin else None
+
+    def GetStockByAlias(self):
+        stock = None
+        if not stock:
+            stock = self._GetStockByCusip()
+        if not stock:
+            stock = self._GetStockBySedol()
+        if not stock:
+            stock = self._GetStockByMonisId()
+        if not stock:
+            stock = self._GetStockByUserId1()
+        if not stock:
+            stock = self._GetStockByUserId2()
+        if not stock:
+            stock = self._GetStockByBloombergSymbol()
+        return stock
+
+
+class DepositaryReceiptRetrieverByUnderlyingIdentifiers(UnderlyingRetrieverByUnderlyingIdentifiers):
+    ''' Responsible for retrieving the depositary receipt (if any) from the database, 
+        using the stock identifiers applied to the FCOM_convertible instance.
+    '''
+
+    acmUnderlyingClass = acm.FDepositaryReceipt
+
+    def __init__(self, FCOM_convertible):
+        self.FCOM_convertible = FCOM_convertible
+        self.up_params = FMonisUploadParameters()
+        self.stockRetriever = StockRetrieverByUnderlyingIdentifiers(FCOM_convertible)
+        
+    def StockRetriever(self):
+        return self.stockRetriever 
+
+    def GetDepositaryReceiptByIsin(self):
+        isin = self.StockRetriever().GetStockIsin()
+        return self.acmUnderlyingClass.Select01('isin=%s' % isin, None) if isin else None  
+    
+    def GetDepositaryReceiptByAlias(self):
+        ''' A stock can be converted by BBG DataLoader into a depositary receipt carrying the same identifiers
+            as the stock. Thus, from a modelling perspective, the depositary receipt can use all the 
+            identifiers from the stock. 
+        '''
+        return self.StockRetriever().GetStockByAlias()
+
+
+class UnderlyingRetrieverByAddInfo(object):
+    ''' Responsible for retrieving underlying entity, using AddInfo-identifiers '''
+
+    def __init__(self, FCOM_convertible):
+        self.FCOM_convertible = FCOM_convertible
+
+    def _GetIdentifierValueOrRaiseError(self):
+        identifier_field = self._GetIdentifierFieldOrRaiseError()
+        try:
+            if identifier_field in ('StockCUSIP',):
+                identifier_value = self.FCOM_convertible.GenericObject().PerformWith('GetInputString', [identifier_field])
+            else:
+                identifier_value = getattr(self.FCOM_convertible, identifier_field)()
+        except:
+            raise Exception('ERROR: Unable to call method %s on COM convertible!' % identifier_field)
+        return identifier_value
+        
+    @staticmethod
+    def _GetAddInfoSpecNameOrRaiseError():
+        try:
+            addInfoSpecName = GLOB_FPARAMS.ADD_INFO_STOCK_ID_SPEC
+        except AttributeError:
+            raise Exception('ERROR: Could not find additional info specification in FParameter ADD_INFO_STOCK_ID_SPEC!')
+        return addInfoSpecName        
+        
+    @staticmethod
+    def _GetIdentifierFieldOrRaiseError():
+        try:
+            identifier_field = GLOB_FPARAMS.MONIS_STOCK_ID_FIELD
+        except AttributeError:
+            raise Exception('ERROR: Could not find Monis ID field in FParameter MONIS_STOCK_ID_FIELD!')
+        return identifier_field           
+
+    @staticmethod
+    def _GetInstrumentOids(addInfoSpecName, identifier_value):
+        spec_oid = acm.FAdditionalInfoSpec.Select01("name = %s" % addInfoSpecName, None).Oid()
+        ins_oids = [ai.Recaddr() for ai in acm.FAdditionalInfo.Select("addInf = %s and fieldValue = %s" % (spec_oid, identifier_value))]
+        return ins_oids
+
+    @staticmethod
+    def _RaiseErrorIfCreateAddInfoIdDisabled(addInfoSpecName, identifier_value):
+        if not FMonisUploadParameters().CREATE_ADD_INFO_ID:
+            raise Exception("Instrument with %s additional info value %s not found, and FParameter CREATE_ADD_INFO_ID is False" % (addInfoSpecName, identifier_value))
+
+    @staticmethod
+    def _GetFoundSingleUnderlying(ins_oids, addInfoSpecName, log):
+        underlying = acm.FStock[ins_oids[0]]
+        if not underlying:
+            underlying = acm.FDepositaryReceipt[ins_oids[0]]
+        if log and underlying:
+            logger.LOG('Found underlying "%s" by additional info %s' % (underlying.Name(), addInfoSpecName))
+        return underlying
+
+    def GetUnderlying(self, log=True):
+        addInfoSpecName = self._GetAddInfoSpecNameOrRaiseError()
+        identifier_value = self._GetIdentifierValueOrRaiseError()
+        ins_oids = self._GetInstrumentOids(addInfoSpecName, identifier_value)
+
+        nr_of_instruments = len(ins_oids)
+        if nr_of_instruments == 0:
+            self._RaiseErrorIfCreateAddInfoIdDisabled(addInfoSpecName, identifier_value)
+            return None
+        elif nr_of_instruments == 1:
+            return self._GetFoundSingleUnderlying(ins_oids, addInfoSpecName, log)
+        else:
+            logger.LOG('Found %d underlyings by additional info %s. Proceeding with the first underlying.' % (nr_of_instruments, addInfoSpecName))
+            return self._GetFoundSingleUnderlying(ins_oids, addInfoSpecName, log)
+
+
+class AliasCreator(object):
+    ''' Responsible for setting aliases on the underlying '''
+
+    def __init__(self, underlying, FCOM_convertible):
+        self.underlying = underlying
+        self.FCOM_convertible = FCOM_convertible
+
+    def _GetAliasByType(self, aliasTypeName):
+        return acm.FInstrumentAlias.Select01('instrument="%s" and type="%s' % (self.underlying.Name(), aliasTypeName), '')
+
+    @staticmethod
+    def _GetAliasTypeByName(aliasTypeName):
+        return acm.FInstrAliasType.Select01('name="%s"' % aliasTypeName, None)
+
+    @staticmethod
+    def _CreateAndSaveAliasType(aliasTypeName):
+        aliasType = acm.FInstrAliasType()
+        aliasType.Name(aliasTypeName)
+        aliasType.AliasTypeDescription('Monis Upload (Stock) Type') # For backwards compatability, the alias type description is left intact
+        SaveUnderlyingObject(aliasType, 'Updated aliasType %s' % aliasTypeName, 'Failed to update aliasType %s' % aliasTypeName)
+        return aliasType
+
+    def _CreateAndSaveAlias(self, aliasType, value):
+        alias = acm.FInstrumentAlias()
+        alias.Instrument(self.underlying)
+        alias.Type(aliasType)
+        alias.Alias(value)
+        SaveUnderlyingObject(alias, 'New alias committed: "%s"' % value, 'Failed to commit new alias "%s"' % value)
+        return alias
+
+    @staticmethod
+    def _UpdateAlias(alias, value):
+        alias.Alias(value)
+        SaveUnderlyingObject(alias, "", 'Failed to update existing alias')
+        return alias
+
+    def _CreateAlias(self, aliasTypeName, value):
+        aliasType = self._GetAliasTypeByName(aliasTypeName)
+        if not aliasType:
+            aliasType = self._CreateAndSaveAliasType(aliasTypeName)
+        alias = self._CreateAndSaveAlias(aliasType, value)
+        return alias
+
+    def _SetAlias(self, aliasTypeName, value):
+        alias = self._GetAliasByType(aliasTypeName)
+        if alias:
+            self._UpdateAlias(alias, value)
+        else:
+            alias = self._CreateAlias(aliasTypeName, value)
+        return alias
+
+    def _DeleteAlias(self, aliasTypeName):
+        alias = self._GetAliasByType(aliasTypeName)
+        if alias:
+            UtilMethods.Delete(alias, "", 'Failed to delete existing alias')
+
+    def CreateAliases(self):
+        up_params = FMonisUploadParameters()
+        up_info = FMonisUploadInstrumentInfo()
+    
+        a_list = []
+        a_list.append([up_params.USE_UND_CUSIP, up_info.ALIAS_UND_CUSIP, self.FCOM_convertible.GenericObject().PerformWith('GetInputString', ['StockCUSIP'])])
+        a_list.append([up_params.USE_UND_SEDOL, up_info.ALIAS_UND_SEDOL, self.FCOM_convertible.StockSEDOL()])
+        a_list.append([up_params.USE_UND_MONIS_ID, up_info.ALIAS_UND_MONISID, self.FCOM_convertible.StockMonisID()])
+        a_list.append([up_params.USE_UND_USER_ID1, up_info.ALIAS_UND_USERID1, self.FCOM_convertible.StockID1Value()])
+        a_list.append([up_params.USE_UND_USER_ID2, up_info.ALIAS_UND_USERID2, self.FCOM_convertible.StockID2Value()])
+        a_list.append([up_params.USE_UND_BLOOMBERGSYMBOL, up_info.ALIAS_UND_BLOOMBERGSYMBOL, self.FCOM_convertible.StockBloombergSymbol()])
+        for aliasInfo in a_list:
+            if aliasInfo[0]:
+                if aliasInfo[2]:
+                    self._SetAlias(aliasInfo[1], aliasInfo[2])
+                else:
+                    self._DeleteAlias(aliasInfo[1])
+
+
+class PriceCreator(object):
+
+    def __init__(self, obj, FCOM_convertible):
+        self.object = obj
+        self.FCOM_convertible = FCOM_convertible
+
+    @staticmethod
+    def _Market():
+        return FMonisUploadInstrumentInfo().UND_PRICE_PARTYID
+
+    def _GetMatchingPrice(self, market):
+        return matching_price(self.object.Prices(), market, self.object.Currency().Name())
+
+    def _SpotPriceOrZero(self):
+        price = self.FCOM_convertible.SpotPrice()
+        if not price:
+            logger.DLOG('No spot price found')
+            price = 0.0
+        return price
+
+    @staticmethod
+    def _DateToday():
+        return acm.Time.DateToday()
+
+    def _SetAttributesOnPrice(self, price, market):
+        spotPrice = self._SpotPriceOrZero()
+        price.Day(self._DateToday())
+        price.Market(market)
+        price.Last(spotPrice)
+        price.Instrument(self.object)
+        price.Currency(self.object.Currency().Name())
+        return price
+
+    def CreatePrice(self):
+        market = self._Market()
+        price = self._GetMatchingPrice(market)
+        if not price:
+            price = acm.FPrice()
+        self._SetAttributesOnPrice(price, market)
+        SaveUnderlyingObject(price, 'Committed new price for "%s"' % self.object.Name(), 'Failed to commit new underlying price for "%s"' % self.object.Name())
+        return price
+
+
+class StockUploader(FMonisIUploader.IUploader):
+    
+    def __init__(self, FCOM_instrument, parameters):
+        self.FCOM_instrument = FCOM_instrument
+        self.parameters = parameters
+        self.stock_created = None
+        self.borrow_cost = None
+        self.dividend_yield = None
+        self.dividend_stream = None
+        self.dividend_stream_link = None
+
+    def remove_new_objects_if_failed_insert(self):
+        if not self.stock_created:
+            return 0
+        if self.borrow_cost:
+            self.borrow_cost.Delete()
+            logger.DLOG("Deleted the borrow cost")
+        if self.dividend_yield:
+            self.dividend_yield.Delete()
+            logger.DLOG("Deleted the dividend yield for the underlying")
+        if self.dividend_stream:
+            self.dividend_stream.Delete()
+            logger.DLOG("Deleted the dividend stream for the underlying")
+        if self.dividend_stream_link:
+            self.dividend_stream_link.Delete()
+            logger.DLOG("Deleted the dividend stream link for the underlying")
+        logger.DLOG("Deleting the newly created stock %s" % self.stock_created.Name())
+        self.stock_created.Delete()
+        
+    def get_underlying_by_name(self, name):
+        underlying = acm.FStock[name]
+        if not underlying:
+            underlying = acm.FDepositaryReceipt[name]
+        return underlying    
+        
+    def get_underlying_by_isin(self):
+        underlying = self.get_stock_by_isin()
+        if not underlying:
+            underlying = self.get_depositaryreceipt_by_isin()
+        return underlying
+            
+    def get_stock_by_isin(self):
+        retriever = StockRetrieverByUnderlyingIdentifiers(self.FCOM_instrument)
+        return retriever.GetStockByIsin()
+        
+    def get_depositaryreceipt_by_isin(self):
+        retriever = DepositaryReceiptRetrieverByUnderlyingIdentifiers(self.FCOM_instrument)
+        return retriever.GetDepositaryReceiptByIsin()    
+        
+    def get_underlying_by_gui_underlying_identifiers(self):
+        underlying = self.get_stock_by_gui_underlying_identifiers()
+        if not underlying:
+            underlying = self.get_depositaryreceipt_by_gui_underlying_identifiers()
+        return underlying   
+        
+    def get_stock_by_gui_underlying_identifiers(self):
+        retriever = StockRetrieverByUnderlyingIdentifiers(self.FCOM_instrument)
+        return retriever.GetStockByAlias()
+        
+    def get_depositaryreceipt_by_gui_underlying_identifiers(self):
+        retriever = DepositaryReceiptRetrieverByUnderlyingIdentifiers(self.FCOM_instrument)
+        return retriever.GetDepositaryReceiptByAlias()        
+
+    def get_underlying_by_add_info(self, log = True):
+        retriever = UnderlyingRetrieverByAddInfo(self.FCOM_instrument)
+        return retriever.GetUnderlying(log)   
+
+    def set_custom_attributes_on_underlying(self, underlying):
+        try:
+            from FMonisHooks import CustomUnderlyingAttributes
+        except ImportError as e:
+            # For backwards compatibility
+            try:
+                from FMonisHooks import CustomStockAttributes
+                CustomUnderlyingAttributes = CustomStockAttributes
+            except ImportError as e:
+                logger.DLOG('Could not import hook for setting custom underlying attributes. Error: %s' % str(e))
+                return                
+        logger.DLOG('Setting custom attributes for %s' % underlying.Name())
+
+        # Repeat commit to handle update collisions
+        i = 0
+        while True:
+            i = i+1
+            underlyingImage = underlying.StorageImage()
+            additionalObjectsToCommit = acm.FArray()
+            CustomUnderlyingAttributes(underlyingImage, self.FCOM_instrument, additionalObjectsToCommit)
+            acm.BeginTransaction()
+            try:
+                SaveUnderlyingObject(underlyingImage, None, \
+                    'Failed to save underlying "%s" after setting custom attributes' % underlyingImage.Name())
+                for obj in additionalObjectsToCommit:
+                    SaveUnderlyingObject(obj, None, \
+                        'Failed to save additional object "%s"' % obj.StringKey())
+                acm.CommitTransaction()
+                logger.DLOG('Saved underlying "%s" after setting custom attributes' % underlyingImage.Name())
+                for obj in additionalObjectsToCommit:
+                    logger.DLOG('Saved additional object "%s"' % obj.StringKey())
+                return
+            except Exception as e:
+                acm.AbortTransaction()
+                if i > 4:
+                    raise UnderlyingUploadError('Failed to set custom attributes. Reason: %s' % str(e))
+                else:
+                    logger.warn('Commit failed setting custom attributes, retrying...')
+            
+    def set_underlying_borrow_cost(self, modified_underlying):
+        FCOM_convertible = self.FCOM_instrument
+        borrowCostUploader = StockBorrowCostUploader(modified_underlying, FCOM_convertible)
+        spread = borrowCostUploader.SetStockBorrowCost()
+        if spread:
+            self.borrow_cost = spread
+
+    def set_dividend_stream(self, dividend_stream):
+        self.dividend_stream = dividend_stream
+
+    def set_dividend_stream_link(self, dividend_stream_link):
+        self.dividend_stream_link = dividend_stream_link
+
+    def upload_dividend_yield(self, modified_underlying):
+        FCOM_convertible = self.FCOM_instrument
+        dividendYieldUploader = StockDividendYieldUploader(modified_underlying, FCOM_convertible)
+        spread = dividendYieldUploader.GetSpreadFromAds()
+        if spread:
+            dividendYieldUploader.UpdateSpread(spread)
+        else:
+            spread = dividendYieldUploader.CreateSpread()
+            self.dividend_yield = spread   
+
+    @staticmethod
+    def get_mapped_div_stream(modified_underlying):
+        return modified_underlying.MappedDividendStream(0).Parameter()
+
+    def upload_dividend_stream(self, modified_underlying):
+        FCOM_convertible = self.FCOM_instrument
+        uploader = DividendStreamUploader(self, \
+            modified_underlying, FCOM_convertible, self.parameters) # the context is sent in as first argument (self)
+        uploader.UploadDividendStream()
+
+    def create_aliases(self, modified_underlying):
+        creator = AliasCreator(modified_underlying, self.FCOM_instrument)
+        creator.CreateAliases()
+        
+    def create_underlying_price(self, modified_underlying):
+        creator = PriceCreator(modified_underlying, self.FCOM_instrument)
+        creator.CreatePrice()
+
+    def get_update_underlying_price(self, up_params):
+        param = self.parameters.get('UPDATE_UNDERLYING_PRICE')
+        if param is not None:
+            return bool(param)
+        return up_params.UPDATE_UNDERLYING_PRICE
+    
+    def create_add_info(self, modified_underlying):
+        FCOM_convertible = self.FCOM_instrument
+        creator = AddInfoCreator(modified_underlying, FCOM_convertible)
+        creator.CreateAddInfo()
+        
+    def create_stock(self, name):
+        stock = acm.FStock()
+        stock.Name(name)
+        return stock
+
+    def upload(self):
+        FCOM_convertible = self.FCOM_instrument
+        underlying_name = FCOM_convertible.StockName()
+        modified_underlying =  None if GLOB_FPARAMS.USE_ADD_INFO_ID else self.get_underlying_by_isin()
+        underlying = None if GLOB_FPARAMS.USE_ADD_INFO_ID else self.get_underlying_by_name(underlying_name)
+        # Check if there exists matching Isin
+        set_isin = 1
+
+        # AR754408 ============================================================
+        # We need to additionally check if ISIN were supposed to be used during
+        # the underlying instrument look up.  If not, then the
+        # modified_underlying found through ISIN cannot be used, and the ISIN
+        # field on newly created underlying cannot be set (set_isin=0).
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Add below code
+        use_und_isin = FMonisUploadParameters().USE_UND_ISIN
+        if not use_und_isin and modified_underlying:
+            debugMsg = (
+                "Found underlying {} (of class {}) by Isin.  However, "
+                "USE_UND_ISIN was set to {}, hence we cannot use this found "
+                "one as the underlying.  If new underlying is to be created, "
+                "the newly created underlying's ISIN will have be blanked "
+                "out to prevent duplication (multiple instrument having same "
+                "ISIN).".format(
+                    modified_underlying.Name(),
+                    modified_underlying.ClassName().Text().strip('F'),
+                    use_und_isin
+                )
+            )
+            logger.DLOG(debugMsg)
+            print(debugMsg)
+            modified_underlying = None
+            set_isin = 0
+        # =====================================================================
+        
+        if modified_underlying:
+            logger.DLOG('Found underlying %s (of class %s) by Isin.' % (modified_underlying.Name(), modified_underlying.ClassName().Text().strip('F')))                        
+            if modified_underlying.Name() != underlying_name:
+                set_isin = 0   
+                logger.DLOG('Isin matched, but the name of the underlying in the XML (%s) does not match with the name of the underlying in the ADS (%s).' \
+                            % (underlying_name, modified_underlying.Name()))
+            if underlying:
+                if modified_underlying.Class() != underlying.Class():
+                    set_isin = 0   
+                    logger.DLOG('The underlying found by name identifier is of class %s, but the underlying found by Isin is of class %s.' \
+                                % (underlying.ClassName().Text().strip('F'), modified_underlying.ClassName().Text().strip('F')))                            
+                                
+        # Check if there exists matching Cusip, SEDOL, MonisID's or Add Infos
+        if not modified_underlying:
+            if GLOB_FPARAMS.USE_ADD_INFO_ID:
+                modified_underlying = self.get_underlying_by_add_info() 
+            else:
+                modified_underlying = self.get_underlying_by_gui_underlying_identifiers()
+        
+        # No matching instrument found; always create a new FStock
+        if not modified_underlying:
+            if underlying:
+                modified_underlying = underlying
+            else:
+                if not int(self.parameters['INSERT']):
+                    raise UnderlyingUploadError("Underlying instrument %s not found in the ADS and the insert instrument toggle is unchecked." % underlying_name)
+                modified_underlying = self.create_stock(underlying_name)
+                self.stock_created = modified_underlying
+                logger.DLOG('No matching underlying was found. Creating new stock with name "%s" by default.' % underlying_name)
+                
+        if not modified_underlying:
+            raise UnderlyingUploadError('Could not create or modify existing underlying.')
+        
+        # Begin setting underlying data
+        if not modified_underlying.Isin() and set_isin:
+            retriever = StockRetrieverByUnderlyingIdentifiers(FCOM_convertible)
+            isin = retriever.GetStockIsin()    
+            modified_underlying.Isin(isin)
+
+        underlying_currency_name = FMonisUploadUtils.stock_curr_name(FCOM_convertible) 
+        
+        if self.stock_created:
+            if FCOM_convertible.PenceQuotedEquity():
+                modified_underlying.Quotation(acm.FQuotation['Per 100 Units'])
+            else:
+                modified_underlying.Quotation(acm.FQuotation['Per Unit'])
+
+            underlying_currency = acm.FCurrency[underlying_currency_name]
+            if underlying_currency:
+                try:
+                    modified_underlying.Currency(underlying_currency_name)
+
+                    try:
+                        if not underlying_currency.MappedDiscountLink().Link().YieldCurveComponent(). \
+                            Currency() == underlying_currency:
+                            logger.WLOG('Currency of underlying "%s" is not mapped to a yield curve of the same currency' % underlying_currency_name)
+                    except Exception:
+                        raise UnderlyingUploadError('Cannot find mapped yield curve of currency "%s"' % underlying_currency_name)
+                except:
+                    raise UnderlyingUploadError('Failed to set currency %s for modified_underlying %s.' %
+                                               (underlying_currency_name, modified_underlying.Name()))
+            else:
+                raise UnderlyingUploadError('Cannot find currency "%s" in ADS.' % underlying_currency_name)
+        else: # elif not up_params.UPDATE_CURRENCY:
+            underlying_currency = acm.FCurrency[underlying_currency_name]
+            try:
+                if not underlying_currency.MappedDiscountLink().Link().YieldCurveComponent(). \
+                    Currency() == underlying_currency:
+                    logger.WLOG('Currency of underlying "%s" is not mapped to a yield curve of the same currency' % underlying_currency_name)
+            except Exception:
+                raise UnderlyingUploadError('Cannot find mapped yield curve of currency "%s"' % underlying_currency_name)
+            if modified_underlying.Currency() != underlying_currency:
+                logger.DLOG('Existing underlying currency %s does not match the currency of underlying being uploaded %s.' %
+                            (modified_underlying.Currency().Name(), underlying_currency_name))
+                     
+        # Underlying needs to be committed, else the InstrumentAlias will receive a negative ins oid
+        SaveUnderlyingObject(  modified_underlying, 'Committed underlying %s of class %s' % \
+                               (modified_underlying.Name(), modified_underlying.ClassName().Text().strip('F')), 
+                               'Failed to commit underlying %s of class %s' %
+                               (modified_underlying.Name(), modified_underlying.ClassName().Text().strip('F')) 
+                             )
+            
+        up_params = FMonisUploadParameters()            
+        if not GLOB_FPARAMS.USE_ADD_INFO_ID:
+            self.create_aliases(modified_underlying)
+            
+        if FMonisUploadParameters().CREATE_ADD_INFO_ID:
+            self.create_add_info(modified_underlying)
+        
+        if self.stock_created or self.get_update_underlying_price(up_params):
+            self.create_underlying_price(modified_underlying)
+            
+        if up_params.UPDATE_STOCK_BORROW:    
+            self.set_underlying_borrow_cost(modified_underlying)
+        
+        if up_params.UPDATE_ABS_DIVIDENDS or self.get_mapped_div_stream(modified_underlying) is None:
+            self.upload_dividend_stream(modified_underlying)
+        
+        if up_params.UPDATE_DIVIDEND_YIELD:
+            self.upload_dividend_yield(modified_underlying)
+                 
+        self.set_custom_attributes_on_underlying(modified_underlying)
+        return modified_underlying
+
+
+def matching_price(prices, market, currency_name):
+    if prices:
+        for price in prices:
+            if (price.Market() and price.Market().Name() == market ) and ( price.Currency().Name() == currency_name):
+                return price
+    return None
+
+...
+
